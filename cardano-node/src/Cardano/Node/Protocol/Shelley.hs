@@ -1,3 +1,5 @@
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
@@ -101,7 +103,7 @@ mkConsensusProtocolShelley NodeShelleyProtocolConfiguration {
     (genesis, genesisHash) <- readGenesis npcShelleyGenesisFile
                                           npcShelleyGenesisFileHash
     firstExceptT GenesisValidationFailure . hoistEither $ validateGenesis genesis
-    optionalLeaderCredentials <- readLeaderCredentials files
+    leaderCredentials <- readLeaderCredentials files
 
     return $
       Consensus.ProtocolShelley
@@ -110,7 +112,7 @@ mkConsensusProtocolShelley NodeShelleyProtocolConfiguration {
         (ProtVer npcShelleySupportedProtocolVersionMajor
                  npcShelleySupportedProtocolVersionMinor)
         (MaxMajorProtVer npcShelleyMaxSupportedProtocolVersion)
-        optionalLeaderCredentials
+        leaderCredentials
 
 genesisHashToPraosNonce :: GenesisHash -> Nonce
 genesisHashToPraosNonce (GenesisHash h) = Nonce (Crypto.castHash h)
