@@ -20,7 +20,6 @@ import           Cardano.Api.Typed hiding (PoolId)
 import           Cardano.Chain.Slotting (EpochSlots (..))
 import           Cardano.CLI.Shelley.Commands
 import           Cardano.CLI.Types
-import           Cardano.Slotting.Slot (EpochNo (..), SlotNo (..))
 import           Control.Monad.Fail (fail)
 import           Data.Attoparsec.Combinator ((<?>))
 import           Data.Time.Clock (UTCTime)

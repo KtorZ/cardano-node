@@ -24,7 +24,7 @@ import qualified Testnet.ByronShelley
 
 testnetProperty :: (H.Conf -> H.Integration ()) -> H.Property
 testnetProperty tn = H.integration . H.workspace "chairman" $ \tempAbsPath' -> do
-  conf@H.Conf {..} <- H.mkConf tempAbsPath' 42
+  conf <- H.mkConf tempAbsPath' 42
 
   -- Fork a thread to keep alive indefinitely any resources allocated by testnet.
   void . liftResourceT . resourceForkIO . forever . liftIO $ IO.threadDelay 10000000
