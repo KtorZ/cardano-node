@@ -15,8 +15,7 @@
 {-# OPTIONS_GHC -Wno-orphans  #-}
 
 module Cardano.Tracing.Tracers
-  ( BlockchainCounters
-  , Tracers (..)
+  ( Tracers (..)
   , TraceOptions
   , mkTracers
   , nullTracers
@@ -30,7 +29,6 @@ import           GHC.Clock (getMonotonicTimeNSec)
 import           Codec.CBOR.Read (DeserialiseFailure)
 import           Data.Aeson (ToJSON (..), Value (..))
 import qualified Data.HashMap.Strict as Map
-import           Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import qualified Data.Text as Text
 import           Network.Mux (MuxTrace, WithMuxBearer)
 import qualified Network.Socket as Socket (SockAddr)
@@ -83,8 +81,7 @@ import           Cardano.Tracing.Config
 import           Cardano.Tracing.Constraints (TraceConstraints)
 import           Cardano.Tracing.ConvertTxId (ConvertTxId)
 import           Cardano.Tracing.Kernel
-import           Cardano.Tracing.Metrics (HasKESMetricsData (..), KESMetricsData (..),
-                     MaxKESEvolutions (..), OperationalCertStartKESPeriod (..))
+import           Cardano.Tracing.Metrics
 import           Cardano.Tracing.MicroBenchmarking
 import           Cardano.Tracing.Queries
 
@@ -250,19 +247,6 @@ instance (StandardHash header, Eq peer) => ElidingTracer
           traceWith (toLogObject' tverb tr) ev
       return (Just ev, count + 1)
 
--- | This structure stores counters of blockchain-related events.
---   These values will be traced periodically.
-data BlockchainCounters = BlockchainCounters
-  { bcTxsProcessedNum        :: !Word64
-  , bcBlocksForgedNum        :: !Word64
-  , bcNodeCannotForgeNum     :: !Word64
-  , bcNodeIsLeaderNum        :: !Word64
-  , bcSlotsMissedNum         :: !Word64
-  }
-
-initialBlockchainCounters :: BlockchainCounters
-initialBlockchainCounters = BlockchainCounters 0 0 0 0 0
-
 -- | Tracers for all system components.
 --
 mkTracers
@@ -278,8 +262,8 @@ mkTracers
   -> NodeKernelData blk
   -> IO (Tracers peer localPeer blk)
 mkTracers tOpts@(TracingOn trSel) tr nodeKern = do
-  bcCounters :: IORef BlockchainCounters <- newIORef initialBlockchainCounters
-  consensusTracers <- mkConsensusTracers trSel verb tr nodeKern bcCounters
+  fStats <- mkForgingStats
+  consensusTracers <- mkConsensusTracers trSel verb tr nodeKern fStats
   elidedChainDB <- newstate  -- for eliding messages in ChainDB tracer
 
   pure Tracers
@@ -432,9 +416,9 @@ mkConsensusTracers
   -> TracingVerbosity
   -> Trace IO Text
   -> NodeKernelData blk
-  -> IORef BlockchainCounters
+  -> ForgingStats
   -> IO (Consensus.Tracers' peer localPeer blk (Tracer IO))
-mkConsensusTracers trSel verb tr nodeKern bcCounters = do
+mkConsensusTracers trSel verb tr nodeKern fStats = do
   blockForgeOutcomeExtractor <- mkOutcomeExtractor
   elidedFetchDecision <- newstate  -- for eliding messages in FetchDecision tr
   forgeTracers <- mkForgeTracers
@@ -451,10 +435,10 @@ mkConsensusTracers trSel verb tr nodeKern bcCounters = do
     , Consensus.txInboundTracer = tracerOnOff (traceTxInbound trSel) verb "TxInbound" tr
     , Consensus.txOutboundTracer = tracerOnOff (traceTxOutbound trSel) verb "TxOutbound" tr
     , Consensus.localTxSubmissionServerTracer = tracerOnOff (traceLocalTxSubmissionServer trSel) verb "LocalTxSubmissionServer" tr
-    , Consensus.mempoolTracer = tracerOnOff' (traceMempool trSel) $ mempoolTracer trSel tr bcCounters
+    , Consensus.mempoolTracer = tracerOnOff' (traceMempool trSel) $ mempoolTracer trSel tr fStats
     , Consensus.forgeTracer = tracerOnOff' (traceForge trSel) $
         Tracer $ \ev -> do
-          traceWith (forgeTracer verb tr forgeTracers nodeKern bcCounters) ev
+          traceWith (forgeTracer verb tr forgeTracers nodeKern fStats) ev
           traceWith (blockForgeOutcomeExtractor
                     $ toLogObject' verb
                     $ appendName "ForgeTime" tr) ev
@@ -590,83 +574,72 @@ forgeTracer
   -> Trace IO Text
   -> ForgeTracers
   -> NodeKernelData blk
-  -> IORef BlockchainCounters
+  -> ForgingStats
   -> Tracer IO (Consensus.TraceForgeEvent blk)
-forgeTracer verb tr forgeTracers nodeKern bcCounters =
+forgeTracer verb tr forgeTracers nodeKern fStats =
   Tracer $ \ev -> do
     traceWith (measureTxsEnd tr) ev
-    traceWith (notifyBlockForging bcCounters tr) ev
-    traceWith (notifySlotsMissedIfNeeded bcCounters tr) ev
+    traceWith (notifyBlockForging fStats tr) ev
+    traceWith (notifySlotsMissedIfNeeded fStats tr) ev
     -- Consensus tracer
     traceWith (annotateSeverity
                  $ teeForge forgeTracers nodeKern verb
                  $ appendName "Forge" tr) ev
 
 notifyBlockForging
-  :: IORef BlockchainCounters
+  :: ForgingStats
   -> Trace IO Text
   -> Tracer IO (Consensus.TraceForgeEvent blk)
-notifyBlockForging bcCounters tr = Tracer $ \case
+notifyBlockForging fStats tr = Tracer $ \case
   Consensus.TraceForgedBlock {} -> do
-    updatedBlocksForged <- atomicModifyIORef' bcCounters (\cnts -> let nc = bcBlocksForgedNum cnts + 1
-                                                                   in (cnts { bcBlocksForgedNum = nc }, nc)
-                                                         )
-    traceCounter "blocksForgedNum" updatedBlocksForged tr
+    fts <- mapForgingCurrentThreadStats fStats $
+      \fts -> fts { ftsBlocksForgedNum = ftsBlocksForgedNum fts + 1 }
+    traceCounter "blocksForgedNum" (ftsBlocksForgedNum fts) tr
   Consensus.TraceNodeCannotForge {} -> do
     -- It means that node have tried to forge new block, but because of misconfiguration
     -- (for example, invalid key) it's impossible.
-    updatedNodeCannotForge <- atomicModifyIORef' bcCounters $ \cnts ->
-      let nc = bcNodeCannotForgeNum cnts + 1
-      in (cnts { bcNodeCannotForgeNum = nc }, nc)
-    traceCounter "nodeCannotForge" updatedNodeCannotForge tr
+    fts <- mapForgingCurrentThreadStats fStats $
+      \fts -> fts { ftsNodeCannotForgeNum = ftsNodeCannotForgeNum fts + 1 }
+    traceCounter "nodeCannotForge" (ftsNodeCannotForgeNum fts) tr
   -- The rest of the constructors.
   _ -> pure ()
 
 notifySlotsMissedIfNeeded
-  :: IORef BlockchainCounters
+  :: ForgingStats
   -> Trace IO Text
   -> Tracer IO (Consensus.TraceForgeEvent blk)
-notifySlotsMissedIfNeeded bcCounters tr = Tracer $ \case
+notifySlotsMissedIfNeeded fStats tr = Tracer $ \case
   Consensus.TraceNodeIsLeader {} -> do
-    updatedNodeIsLeaderNum <- atomicModifyIORef' bcCounters (\cnts -> let nc = bcNodeIsLeaderNum cnts + 1
-                                                                      in (cnts { bcNodeIsLeaderNum = nc }, nc)
-                                                            )
-    traceCounter "nodeIsLeaderNum" updatedNodeIsLeaderNum tr
+    fts <- mapForgingCurrentThreadStats fStats $
+      \fts -> fts { ftsNodeIsLeaderNum = ftsNodeIsLeaderNum fts + 1 }
+    traceCounter "nodeIsLeaderNum" (ftsNodeIsLeaderNum fts) tr
   Consensus.TraceNodeNotLeader {} -> do
     -- Not is not a leader again, so now the number of blocks forged by this node
     -- should be equal to the number of slots when this node was a leader.
-    counters <- readIORef bcCounters
-    let howManyBlocksWereForged = bcBlocksForgedNum counters
-        timesNodeWasALeader = bcNodeIsLeaderNum counters
-        numberOfMissedSlots = timesNodeWasALeader - howManyBlocksWereForged
-    if numberOfMissedSlots > 0
-    then do
-        -- Node was a leader more times than the number of forged blocks,
-        -- it means that some slots were missed.
-      updatesSlotsMissed <- atomicModifyIORef' bcCounters (\cnts -> let nc = bcSlotsMissedNum cnts + numberOfMissedSlots
-                                                                    in (cnts { bcSlotsMissedNum = nc }, nc)
-                                                          )
-      traceCounter "slotsMissedNum" updatesSlotsMissed tr
-    else return ()
+    fts <- mapForgingCurrentThreadStats fStats updateMissedSlots
+    traceCounter "slotsMissedNum" (ftsSlotsMissedNum fts) tr
   -- The rest of the constructors.
   _ -> pure ()
+ where
+   updateMissedSlots :: ForgeThreadStats -> ForgeThreadStats
+   updateMissedSlots fts = fts
+     { ftsSlotsMissedNum = ftsNodeIsLeaderNum fts - ftsBlocksForgedNum fts
+     }
 
 
 --------------------------------------------------------------------------------
 -- Mempool Tracers
 --------------------------------------------------------------------------------
 
-notifyTxsProcessed :: IORef BlockchainCounters -> Trace IO Text -> Tracer IO (TraceEventMempool blk)
-notifyTxsProcessed bcCounters tr = Tracer $ \case
+notifyTxsProcessed :: ForgingStats -> Trace IO Text -> Tracer IO (TraceEventMempool blk)
+notifyTxsProcessed fStats tr = Tracer $ \case
   TraceMempoolRemoveTxs [] _ -> return ()
   TraceMempoolRemoveTxs txs _ -> do
     -- TraceMempoolRemoveTxs are previously valid transactions that are no longer valid because of
     -- changes in the ledger state. These transactions are already removed from the mempool,
     -- so we can treat them as completely processed.
-    updatedTxProcessed <- atomicModifyIORef' bcCounters (\cnts -> let nc = bcTxsProcessedNum cnts + fromIntegral (length txs)
-                                                                  in (cnts { bcTxsProcessedNum = nc }, nc)
-                                                        )
-    traceCounter "txsProcessedNum" updatedTxProcessed tr
+    updatedTxProcessed <- mapForgingStatsTxsProcessed fStats (+ (length txs))
+    traceCounter "txsProcessedNum" (fromIntegral updatedTxProcessed) tr
   -- The rest of the constructors.
   _ -> return ()
 
@@ -695,11 +668,11 @@ mempoolTracer
      )
   => TraceSelection
   -> Trace IO Text
-  -> IORef BlockchainCounters
+  -> ForgingStats
   -> Tracer IO (TraceEventMempool blk)
-mempoolTracer tc tracer bChainCounters = Tracer $ \ev -> do
+mempoolTracer tc tracer fStats = Tracer $ \ev -> do
     traceWith (mempoolMetricsTraceTransformer tracer) ev
-    traceWith (notifyTxsProcessed bChainCounters tracer) ev
+    traceWith (notifyTxsProcessed fStats tracer) ev
     traceWith (measureTxsStart tracer) ev
     let tr = appendName "Mempool" tracer
     traceWith (mpTracer tc tr) ev

@@ -14,13 +14,23 @@ module Cardano.Tracing.Metrics
   , MaxKESEvolutions (..)
   , OperationalCertStartKESPeriod (..)
   , HasKESMetricsData (..)
+  , ForgingStats (..)
+  , ForgeThreadStats (..)
+  , mapForgingCurrentThreadStats
+  , mapForgingStatsTxsProcessed
+  , mkForgingStats
   ) where
 
+import           Prelude (id)
 import           Cardano.Prelude hiding (All, (:.:))
 
 import           Cardano.Crypto.KES.Class (Period)
+import           Control.Arrow ((&&&))
+import           Control.Concurrent (myThreadId)
+import           Data.IORef (IORef, atomicModifyIORef', newIORef)
+import qualified Data.Map.Strict as Map
 import           Data.SOP.Strict (All, (:.:)(..), hcmap, K (..), hcollapse)
-import           Ouroboros.Consensus.Block (ForgeStateInfo)
+import           Ouroboros.Consensus.Block (ForgeStateInfo, SlotNo)
 import           Ouroboros.Consensus.Byron.Ledger.Block (ByronBlock)
 import           Ouroboros.Consensus.HardFork.Combinator
 import           Ouroboros.Consensus.TypeFamilyWrappers (WrapForgeStateInfo (..))
@@ -105,3 +115,48 @@ instance All HasKESMetricsData xs => HasKESMetricsData (HardForkBlock xs) where
       -- instead of the KESMetricsData of the current Shelley era.
       combineKESMetrics :: [KESMetricsData] -> KESMetricsData
       combineKESMetrics = lastDef NoKESMetricsData
+
+-- | This structure stores counters of blockchain-related events,
+--   per individual forge thread.
+--   These counters are driven by traces.
+data ForgingStats
+  = ForgingStats
+  { fsTxsProcessedNum               :: !(IORef Word64)
+  , fsState                         :: !(IORef (Map ThreadId ForgeThreadStats))
+  }
+
+data ForgeThreadStats = ForgeThreadStats
+  { ftsBlocksForgedNum              :: !Word64
+  , ftsNodeCannotForgeNum           :: !Word64
+  , ftsNodeIsLeaderNum              :: !Word64
+  , ftsSlotsMissedNum               :: !Word64
+  , ftsLeadershipChecksInitiated    :: !Word64
+  , ftsFirstSlot                    :: !(Maybe SlotNo)
+  }
+
+mkForgingStats :: IO ForgingStats
+mkForgingStats =
+  ForgingStats
+    <$> newIORef 0
+    <*> newIORef mempty
+
+mapForgingStatsTxsProcessed ::
+     ForgingStats
+  -> (Int -> Int)
+  -> IO Int
+mapForgingStatsTxsProcessed fs f =
+  atomicModifyIORef' (fsTxsProcessedNum fs)
+    (fromIntegral &&& id . f . fromIntegral)
+
+mapForgingCurrentThreadStats ::
+     ForgingStats
+  -> (ForgeThreadStats -> ForgeThreadStats)
+  -> IO ForgeThreadStats
+mapForgingCurrentThreadStats fs f = do
+  tid <- myThreadId
+  atomicModifyIORef' (fsState fs) $
+    (id &&& (Map.! tid)) -- We're guaranteed to have the tid by the next line,
+                         --  so Map.! is morally acceptable.
+    . Map.alter (Just . f . fromMaybe initialStats) tid
+ where
+   initialStats = ForgeThreadStats 0 0 0 0 0 Nothing
