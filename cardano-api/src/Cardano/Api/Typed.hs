@@ -828,7 +828,7 @@ queryNodeLocalState connctInfo pointAndQuery = do
         SendMsgAcquire (Just point) $
         ClientStAcquiring {
           recvMsgAcquired =
-            SendMsgQuery query $
+            pure $ SendMsgQuery query $
             ClientStQuerying {
               recvMsgResult = \result -> do
                 --TODO: return the result via the SendMsgDone rather than
